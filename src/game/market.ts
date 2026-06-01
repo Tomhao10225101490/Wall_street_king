@@ -56,6 +56,57 @@ const BASE_PRICES: Record<string, number> = {
   MUD: 9.2,
 };
 
+/** 每分钟最大涨跌幅（普通 / 极端行情） */
+const MAX_TICK_CHANGE = 0.022;
+const MAX_TICK_CHANGE_EXTREME = 0.045;
+/** 相对开盘价日内最大涨跌倍数 */
+const MAX_INTRADAY_RATIO = 1.35;
+const MIN_INTRADAY_RATIO = 0.65;
+/** 相对上市基准价的最大偏离倍数 */
+const MAX_VS_BASE = 2.5;
+const MIN_VS_BASE = 0.2;
+/** 动量上限，防止狂热日正反馈失控 */
+const MAX_MOMENTUM = 0.12;
+/** 多条新闻叠加后的冲击上限（tick 前） */
+const MAX_NEWS_IMPACT_STACK = 1.2;
+
+function getBasePrice(ticker: string): number {
+  return BASE_PRICES[ticker] ?? 50;
+}
+
+function clampTickDelta(delta: number, regime: MarketRegime, flashCrash: boolean): number {
+  const cap =
+    flashCrash || regime === 'crash' || regime === 'mania'
+      ? MAX_TICK_CHANGE_EXTREME
+      : MAX_TICK_CHANGE;
+  return Math.max(-cap, Math.min(cap, delta));
+}
+
+/** 将价格限制在基准价与当日开盘价附近的合理区间 */
+export function boundStockPrice(ticker: string, price: number, openPrice: number): number {
+  const base = getBasePrice(ticker);
+  const maxP = Math.min(base * MAX_VS_BASE, openPrice * MAX_INTRADAY_RATIO);
+  const minP = Math.max(0.5, Math.max(base * MIN_VS_BASE, openPrice * MIN_INTRADAY_RATIO));
+  return Math.max(minP, Math.min(maxP, price));
+}
+
+function clampMomentum(momentum: number): number {
+  return Math.max(-MAX_MOMENTUM, Math.min(MAX_MOMENTUM, momentum));
+}
+
+function applyPriceChange(
+  stock: Stock,
+  delta: number,
+  regime: MarketRegime,
+  flashCrash: boolean
+): { price: number; momentum: number; delta: number } {
+  const clampedDelta = clampTickDelta(delta, regime, flashCrash);
+  let price = stock.price * (1 + clampedDelta);
+  price = boundStockPrice(stock.ticker, price, stock.openPrice);
+  const momentum = clampMomentum(stock.momentum * 0.92 + clampedDelta * 4);
+  return { price, momentum, delta: clampedDelta };
+}
+
 function initSectorSentiment(): Record<Sector, number> {
   return {
     robotics: 0,
@@ -197,7 +248,7 @@ function impactForStock(stock: Stock, impacts: ScheduledImpact[], minute: number
     const mult = tickerHit ? 1 : 0.45;
     total += dir * strength * mult;
   }
-  return total;
+  return Math.max(-MAX_NEWS_IMPACT_STACK, Math.min(MAX_NEWS_IMPACT_STACK, total));
 }
 
 function rngSign(ticker: string, minute: number): number {
@@ -214,11 +265,13 @@ export function applyTradeImpact(
   const stock = getStock(state, ticker);
   if (!stock) return state;
   const sign = side === 'buy' || side === 'cover' ? 1 : -1;
-  const impact = sign * (notional / (stock.liquidity * 500_000));
+  const rawImpact = sign * (notional / (stock.liquidity * 500_000));
+  const impact = Math.max(-0.03, Math.min(0.03, rawImpact));
   const stocks = state.stocks.map((s) => {
     if (s.ticker !== ticker) return s;
-    const playerImpact = s.playerImpact + impact;
-    const price = Math.max(0.5, s.price * (1 + impact * 0.5));
+    const playerImpact = Math.max(-0.05, Math.min(0.05, s.playerImpact + impact));
+    const tradeDelta = clampTickDelta(impact * 0.4, state.regime, false);
+    const price = boundStockPrice(s.ticker, s.price * (1 + tradeDelta), s.openPrice);
     return { ...s, playerImpact, price };
   });
   return { ...state, stocks };
@@ -235,8 +288,8 @@ function runAiParticipants(state: MarketState, rng: Rng): MarketState {
       whaleCooldown: 8 + Math.floor(rng.next() * 5),
       stocks: next.stocks.map((s, i) => {
         if (i !== idx) return s;
-        const price = Math.max(0.5, s.price * (1 + pulse));
-        return { ...s, price, momentum: s.momentum + pulse * 2 };
+        const { price, momentum } = applyPriceChange(s, pulse, state.regime, false);
+        return { ...s, price, momentum };
       }),
     };
   }
@@ -246,11 +299,12 @@ function runAiParticipants(state: MarketState, rng: Rng): MarketState {
     if (hot) {
       next = {
         ...next,
-        stocks: next.stocks.map((s) =>
-          s.ticker === hot.ticker
-            ? { ...s, price: s.price * (1 + 0.008 + rng.next() * 0.012), momentum: s.momentum + 0.02 }
-            : s
-        ),
+        stocks: next.stocks.map((s) => {
+          if (s.ticker !== hot.ticker) return s;
+          const bump = 0.006 + rng.next() * 0.008;
+          const { price, momentum } = applyPriceChange(s, bump, 'mania', false);
+          return { ...s, price, momentum };
+        }),
       };
     }
   }
@@ -261,9 +315,16 @@ function runAiParticipants(state: MarketState, rng: Rng): MarketState {
     if (pick) {
       next = {
         ...next,
-        stocks: next.stocks.map((s) =>
-          s.ticker === pick.ticker ? { ...s, price: s.price * (1 + 0.0015), hiddenTrend: s.hiddenTrend + 0.00005 } : s
-        ),
+        stocks: next.stocks.map((s) => {
+          if (s.ticker !== pick.ticker) return s;
+          const { price, momentum } = applyPriceChange(s, 0.0012, state.regime, false);
+          return {
+            ...s,
+            price,
+            momentum,
+            hiddenTrend: Math.max(-0.001, Math.min(0.001, s.hiddenTrend + 0.00002)),
+          };
+        }),
       };
     }
   }
@@ -281,20 +342,30 @@ export function tickMarket(state: MarketState, rng: Rng): MarketState {
 
   let stocks = state.stocks.map((stock) => {
     const newsImpact = impactForStock(stock, state.activeImpacts, minute);
-    const sector = state.sectorSentiment[stock.sector] * 0.0004;
-    const sentiment = stock.sentiment * 0.0002;
+    const sector = state.sectorSentiment[stock.sector] * 0.00035;
+    const sentiment = stock.sentiment * 0.00015;
     const trend = stock.hiddenTrend;
-    const momDecay = stock.momentum * 0.92;
-    const noise = gaussian(rng) * stock.volatility * volMult * 0.004;
-    const playerDecay = stock.playerImpact * 0.65;
-    const market = state.marketSentiment * 0.00015;
-    let delta = drift + trend + sector + sentiment + newsImpact * 0.003 + noise + market + playerDecay * 0.002;
+    const noise =
+      Math.max(-0.004, Math.min(0.004, gaussian(rng) * stock.volatility * volMult * 0.003));
+    const playerDecay = stock.playerImpact * 0.55;
+    const market = state.marketSentiment * 0.00012;
+    const momPull = -stock.momentum * 0.08;
+    let delta =
+      drift +
+      trend +
+      sector +
+      sentiment +
+      newsImpact * 0.0025 +
+      noise +
+      market +
+      playerDecay * 0.0015 +
+      momPull;
 
-    if (flashCrash) delta -= 0.008 + rng.next() * 0.015;
+    if (flashCrash) delta -= 0.006 + rng.next() * 0.01;
 
-    let price = stock.price * (1 + delta);
-    price = Math.max(0.5, price);
-    const momentum = momDecay + delta * 8;
+    const { price, momentum } = applyPriceChange(stock, delta, state.regime, flashCrash);
+    const boundedHigh = boundStockPrice(stock.ticker, Math.max(stock.dayHigh, price), stock.openPrice);
+    const boundedLow = boundStockPrice(stock.ticker, Math.min(stock.dayLow, price), stock.openPrice);
     const history = [...stock.priceHistory.slice(1), price];
     const volume = stock.volume + Math.floor(rng.next() * 5000 * stock.liquidity);
 
@@ -303,8 +374,8 @@ export function tickMarket(state: MarketState, rng: Rng): MarketState {
       price,
       momentum,
       playerImpact: playerDecay,
-      dayHigh: Math.max(stock.dayHigh, price),
-      dayLow: Math.min(stock.dayLow, price),
+      dayHigh: boundedHigh,
+      dayLow: boundedLow,
       volume,
       priceHistory: history,
     };
@@ -335,8 +406,10 @@ export function resetMarketForNewDay(
   rng: Rng
 ): MarketState {
   const stocks = state.stocks.map((s) => {
+    const base = getBasePrice(s.ticker);
     const jitter = 0.98 + rng.next() * 0.04;
-    const price = Math.max(0.5, s.price * jitter);
+    const blended = s.price * 0.35 * jitter + base * 0.65;
+    const price = boundStockPrice(s.ticker, blended, blended);
     return {
       ...s,
       price,
@@ -347,7 +420,7 @@ export function resetMarketForNewDay(
       momentum: 0,
       playerImpact: 0,
       priceHistory: Array(HISTORY_LENGTH).fill(price),
-      hiddenTrend: s.hiddenTrend + (rng.next() - 0.5) * 0.0003,
+      hiddenTrend: Math.max(-0.0008, Math.min(0.0008, (rng.next() - 0.5) * 0.0004)),
     };
   });
   return {
@@ -375,5 +448,7 @@ export function isMarketOpen(minutes: number): boolean {
 
 export function dayChangePercent(stock: Stock): number {
   if (stock.openPrice <= 0) return 0;
-  return ((stock.price - stock.openPrice) / stock.openPrice) * 100;
+  const raw = ((stock.price - stock.openPrice) / stock.openPrice) * 100;
+  if (!Number.isFinite(raw)) return 0;
+  return Math.max(-65, Math.min(35, raw));
 }
